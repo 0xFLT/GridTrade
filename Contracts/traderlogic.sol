@@ -6,17 +6,16 @@ import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract TraderLogic {
-    ISwapRouter public uniswapRouter;
-    AggregatorV3Interface public priceFeed;
-    IERC20 public usdtToken;
-
-    // Address of the WETH token, which is needed for trading with Uniswap V3
-    address public wethTokenAddress;
+    ISwapRouter public immutable uniswapRouter;
+    AggregatorV3Interface public immutable priceFeed;
+    AggregatorV3Interface public immutable gasPriceFeed;
+    IERC20 public immutable usdtToken;
+    IERC20 public immutable wethToken;
 
     // Constants for trading
-    uint256 public constant GAS_ESTIMATE = 200000; // Example gas estimate for a trade
     uint256 public constant MAX_GAS_COST_USD = 40 * 1e18; // $40 with 18 decimals
-    uint256 public constant TRADE_PERCENTAGE = 2; // Use 2% of the total deposited amount for trading
+    uint256 public constant SLIPPAGE_TOLERANCE = 200; // 2% slippage tolerance
+    uint24 public constant POOL_FEE = 3000; // 0.3% pool fee
 
     // State variables
     mapping(address => uint256) public initialDeposits;
@@ -24,45 +23,96 @@ contract TraderLogic {
     mapping(address => uint256) public lastTradeBlock;
 
     // Events
-    event TradeInitiated(address indexed user, uint256 amountETH, uint256 amountUSDT);
+    event TradeInitiated(address indexed user, bool isBuy, uint256 amountETH, uint256 amountUSDT);
 
-    constructor(address _priceFeed, address _uniswapRouter, address _usdtToken, address _wethToken) {
+    constructor(
+        address _priceFeed,
+        address _gasPriceFeed,
+        address _uniswapRouter,
+        address _usdtToken,
+        address _wethToken
+    ) {
         priceFeed = AggregatorV3Interface(_priceFeed);
+        gasPriceFeed = AggregatorV3Interface(_gasPriceFeed);
         uniswapRouter = ISwapRouter(_uniswapRouter);
         usdtToken = IERC20(_usdtToken);
-        wethTokenAddress = _wethToken;
+        wethToken = IERC20(_wethToken);
     }
 
-    // Assume this function is called by the GridTrade contract when a new deposit is received
+    // Function to execute a trade if it's profitable
     function initiateTrade(address depositor, uint256 depositAmountETH) external {
-        require(depositAmountETH > 0, "Deposit amount must be greater than zero");
-        uint256 ethPriceUSD = getCurrentETHPrice();
-        uint256 totalDepositUSD = (depositAmountETH * ethPriceUSD) / 1e18; // Convert deposit amount to USD
+        require(initialDeposits[depositor] > 0, "No initial deposit recorded for this address");
+        require(block.number >= lastTradeBlock[depositor] + 1000, "Not enough blocks have passed since the last trade");
 
-        // Record the deposit details
-        initialDeposits[depositor] = depositAmountETH;
-        initialPrices[depositor] = ethPriceUSD;
+        uint256 currentPrice = getCurrentETHPrice();
+        uint256 initialPrice = initialPrices[depositor];
+        uint256 tradeAmountETH = (initialDeposits[depositor] * TRADE_PERCENTAGE) / 100;
+
+        // Check the profitability of the trade
+        bool isBuy = currentPrice < initialPrice;
+        uint256 priceDifference = isBuy ? initialPrice - currentPrice : currentPrice - initialPrice;
+        uint256 profitMargin = priceDifference * tradeAmountETH;
+
+        // Estimate gas costs
+        uint256 gasCost = estimateGasCost();
+        require(profitMargin > gasCost, "Trade is not profitable after gas costs");
+
+        // Calculate the minimum amount out to handle slippage
+        uint256 amountOutMinimum = isBuy ? 
+            (tradeAmountETH * currentPrice * (10000 - SLIPPAGE_TOLERANCE)) / 1e6 : 
+            (tradeAmountETH * (10000 - SLIPPAGE_TOLERANCE)) / 10000;
+
+        // Execute the trade
+        uint256 amountOut = performSwap(depositor, isBuy, tradeAmountETH, amountOutMinimum);
+
+        emit TradeInitiated(depositor, isBuy, tradeAmountETH, amountOut);
         lastTradeBlock[depositor] = block.number;
+    }
 
-        // Sell 40% of ETH for USDT
-        uint256 amountToSellETH = (depositAmountETH * 40) / 100;
+    // Helper function to perform the swap on Uniswap V3
+    function performSwap(
+        address depositor,
+        bool isBuy,
+        uint256 tradeAmountETH,
+        uint256 amountOutMinimum
+    ) private returns (uint256 amountOut) {
+        // Prepare parameters for the swap
+        address tokenIn = isBuy ? address(usdtToken) : address(wethToken);
+        address tokenOut = isBuy ? address(wethToken) : address(usdtToken);
+        uint256 deadline = block.timestamp + 15; // 15 seconds from the current block timestamp
 
-        // Check if the estimated gas cost is less than $40
-        uint256 estimatedGasCostETH = GAS_ESTIMATE * tx.gasprice;
-        uint256 estimatedGasCostUSD = (estimatedGasCostETH * ethPriceUSD) / 1e18;
-        require(estimatedGasCostUSD <= MAX_GAS_COST_USD, "Estimated gas cost exceeds $40 USD");
+        // Approve token transfer to Uniswap router
+        IERC20(tokenIn).approve(address(uniswapRouter), tradeAmountETH);
 
-        // Implement the trade with Uniswap V3 here
-        // This is a placeholder; actual Uniswap V3 swap logic should be used
-        // For this example, we emit an event instead of performing a swap
-        emit TradeInitiated(depositor, amountToSellETH, 0); // Replace 0 with actual USDT bought amount
+        // Perform the swap
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: POOL_FEE,
+            recipient: depositor,
+            deadline: deadline,
+            amountIn: tradeAmountETH,
+            amountOutMinimum: amountOutMinimum,
+            sqrtPriceLimitX96: 0
+        });
+
+        amountOut = uniswapRouter.exactInputSingle(params);
+        return amountOut;
     }
 
     // Helper function to get the current ETH price in USD
     function getCurrentETHPrice() public view returns (uint256) {
         (, int256 price, , , ) = priceFeed.latestRoundData();
-        return uint256(price);
+        return uint256(price) * 1e10; // Adjusting to 18 decimal places
     }
 
+    // Helper function to estimate the gas cost
+    function estimateGasCost() public view returns (uint256 gasCostUSD) {
+        (, int256 gasPrice, , , ) = gasPriceFeed.latestRoundData();
+        uint256 gasPriceWei = uint256(gasPrice) * 1e9; // Convert gwei to wei
+        uint256 ethPriceUSD = getCurrentETHPrice();
+        uint256 estimatedGas = GAS_ESTIMATE * gasPriceWei;
+        gasCostUSD = (estimatedGas * ethPriceUSD) / 1e18;
+        return gasCostUSD;
+    }
 }
-
