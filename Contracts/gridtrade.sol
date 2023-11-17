@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./Ownable.sol";
-import "./TraderLogic.sol"; // Importing the TraderLogic contract
+import "./ownables.sol";
+import "./traderlogic.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract GridTrade is Ownable {
     AggregatorV3Interface public priceFeed;
     IERC20 public usdtToken;
-    TraderLogic public traderLogic; // Instance of the TraderLogic contract
+    TraderLogic public traderLogic;    // Instance of the TraderLogic contract
 
     uint256 public constant MINIMUM_DEPOSIT_USD = 10000 * 1e18; // $10k with 18 decimals
     uint256 public constant BLOCKS_TILL_WITHDRAWAL = 100000;
@@ -81,4 +81,5 @@ contract GridTrade is Ownable {
         to.transfer(amount);
         emit InsufficientFundsHandled(msg.sender, to, amount);
     }
+
 }
