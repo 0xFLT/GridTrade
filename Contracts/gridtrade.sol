@@ -18,8 +18,9 @@ contract GridTrade is Ownable {
 
     // Events
     event DepositReceived(address indexed depositor, uint256 ethAmount, uint256 blockNumber);
-    event InsufficientDeposit(address indexed depositor, uint256 ethAmount, uint256 blockNumber);
+    event InsufficientDeposit(address indexed depositor, uint256 ethAmount);
     event FullWithdrawal(address indexed depositor, uint256 ethWithdrawn, uint256 ethFee);
+    event InsufficientFundsHandled(address indexed handler, address to, uint256 amount);
 
     constructor(address _priceFeed, address _usdtAddress, address _traderLogicAddress) {
         priceFeed = AggregatorV3Interface(_priceFeed);
@@ -34,21 +35,18 @@ contract GridTrade is Ownable {
             lastDepositBlock[msg.sender] = block.number;
             ethBalances[msg.sender] += msg.value;
             emit DepositReceived(msg.sender, msg.value, block.number);
-            // Placeholder for calling a function from TraderLogic contract
-            // traderLogic.performTrade(msg.sender, msg.value);
+            // Call to the trading logic will be here
         } else {
-            // Emit an event that the deposit was insufficient
-            emit InsufficientDeposit(msg.sender, msg.value, block.number);
+            emit InsufficientDeposit(msg.sender, msg.value);
         }
     }
 
     // Helper function to get the USD value of the deposited ETH
     function getUSDValue(uint256 ethAmount) public view returns (uint256) {
         (, int256 price, , , ) = priceFeed.latestRoundData();
-        uint256 ethPrice = uint256(price);
         // Convert price to uint256 for safe multiplication
         // Assuming the price feed uses 8 decimals, adjust to match ETH's 18 decimals
-        return (ethAmount * ethPrice) / 1e8;
+        return (ethAmount * uint256(price)) / 1e8;
     }
 
     // Withdrawal function to allow depositors to withdraw their full balances
@@ -56,30 +54,31 @@ contract GridTrade is Ownable {
         require(block.number >= lastDepositBlock[msg.sender] + BLOCKS_TILL_WITHDRAWAL, "Withdrawal is locked");
 
         uint256 depositorEthBalance = ethBalances[msg.sender];
-        require(depositorEthBalance > 0, "No balance to withdraw");
+        require(depositorEthBalance > 0, "No ETH balance to withdraw");
 
-        // Calculate and transfer the 1% fee to the owner
         uint256 ethFee = depositorEthBalance / 100;
         uint256 ethWithdrawalAmount = depositorEthBalance - ethFee;
 
-        ethBalances[msg.sender] = 0; // Reset the depositor's ETH balance
+        // Reset the depositor's balance to zero
+        ethBalances[msg.sender] = 0;
 
         // Transfer the fee to the owner
-        if(ethFee > 0) {
+        if (ethFee > 0) {
             payable(owner()).transfer(ethFee);
         }
 
-        // Transfer the remaining ETH balance to the depositor
-        if(ethWithdrawalAmount > 0) {
+        // Transfer the remaining balance to the depositor
+        if (ethWithdrawalAmount > 0) {
             payable(msg.sender).transfer(ethWithdrawalAmount);
         }
 
-        // Emit the withdrawal event
         emit FullWithdrawal(msg.sender, ethWithdrawalAmount, ethFee);
     }
 
+    // Function for the owner to handle ETH that was sent as an insufficient deposit
+    function handleInsufficientDeposit(address payable to, uint256 amount) external onlyOwner {
+        require(amount <= address(this).balance, "Insufficient balance in contract");
+        to.transfer(amount);
+        emit InsufficientFundsHandled(msg.sender, to, amount);
+    }
 }
-
-
-
-
