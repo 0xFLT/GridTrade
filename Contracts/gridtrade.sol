@@ -2,96 +2,84 @@
 pragma solidity ^0.8.0;
 
 import "./Ownable.sol";
-import "./TraderLogic.sol";
+import "./TraderLogic.sol"; // Importing the TraderLogic contract
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract GridTrade is Ownable {
     AggregatorV3Interface public priceFeed;
-    TraderLogic public traderLogic;
     IERC20 public usdtToken;
+    TraderLogic public traderLogic; // Instance of the TraderLogic contract
 
+    uint256 public constant MINIMUM_DEPOSIT_USD = 10000 * 1e18; // $10k with 18 decimals
     uint256 public constant BLOCKS_TILL_WITHDRAWAL = 100000;
     mapping(address => uint256) public lastDepositBlock;
     mapping(address => uint256) public ethBalances;
-    mapping(address => uint256) public usdtBalances;
 
-    // Event to signal a deposit has been made
-    event DepositReceived(address indexed depositor, uint256 amount, uint256 blockNumber);
-    
-    // Event to signal a trade has been executed
-    event TradeExecuted(address indexed depositor, uint256 ethSold, uint256 usdtBought);
-    
-    // Event to signal a withdrawal has been made
-    event WithdrawalMade(address indexed withdrawer, uint256 ethAmount, uint256 usdtAmount);
+    // Events
+    event DepositReceived(address indexed depositor, uint256 ethAmount, uint256 blockNumber);
+    event InsufficientDeposit(address indexed depositor, uint256 ethAmount, uint256 blockNumber);
+    event FullWithdrawal(address indexed depositor, uint256 ethWithdrawn, uint256 ethFee);
 
-    constructor(address _priceFeed, address _traderLogic, address _usdtAddress) {
+    constructor(address _priceFeed, address _usdtAddress, address _traderLogicAddress) {
         priceFeed = AggregatorV3Interface(_priceFeed);
-        traderLogic = TraderLogic(_traderLogic);
         usdtToken = IERC20(_usdtAddress);
+        traderLogic = TraderLogic(_traderLogicAddress); // Initialize the TraderLogic instance
     }
 
-    // Function to handle ETH deposits and execute initial trade
-    function depositETH() external payable {
-        require(msg.value > 0, "Cannot deposit 0 ETH");
-        
-        // Record the block number at the time of deposit
-        lastDepositBlock[msg.sender] = block.number;
-        ethBalances[msg.sender] += msg.value; // Update the depositor's ETH balance
-        
-        // Emit an event that a deposit has occurred
-        emit DepositReceived(msg.sender, msg.value, block.number);
-        
-        // Convert half of the deposit to USDT through TraderLogic
-        uint256 halfDeposit = msg.value / 2;
-        // Assume TraderLogic trade function returns the amount of USDT bought
-        uint256 usdtBought = traderLogic.trade{ value: halfDeposit }(address(this), address(usdtToken), halfDeposit);
-
-        // Update the depositor's USDT balance
-        usdtBalances[msg.sender] += usdtBought;
-        
-        // Emit a TradeExecuted event with the actual USDT bought amount
-        emit TradeExecuted(msg.sender, halfDeposit, usdtBought);
+    // Fallback function to handle ETH deposits
+    receive() external payable {
+        uint256 usdValue = getUSDValue(msg.value);
+        if (usdValue >= MINIMUM_DEPOSIT_USD) {
+            lastDepositBlock[msg.sender] = block.number;
+            ethBalances[msg.sender] += msg.value;
+            emit DepositReceived(msg.sender, msg.value, block.number);
+            // Placeholder for calling a function from TraderLogic contract
+            // traderLogic.performTrade(msg.sender, msg.value);
+        } else {
+            // Emit an event that the deposit was insufficient
+            emit InsufficientDeposit(msg.sender, msg.value, block.number);
+        }
     }
 
-    // Function to withdraw funds (ETH and USDT)
-    // 1% fee is taken on withdrawal and sent to the contract creator
-    function withdrawFunds(uint256 ethAmount, uint256 usdtAmount) public {
+    // Helper function to get the USD value of the deposited ETH
+    function getUSDValue(uint256 ethAmount) public view returns (uint256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        uint256 ethPrice = uint256(price);
+        // Convert price to uint256 for safe multiplication
+        // Assuming the price feed uses 8 decimals, adjust to match ETH's 18 decimals
+        return (ethAmount * ethPrice) / 1e8;
+    }
+
+    // Withdrawal function to allow depositors to withdraw their full balances
+    function withdrawFullBalance() public {
         require(block.number >= lastDepositBlock[msg.sender] + BLOCKS_TILL_WITHDRAWAL, "Withdrawal is locked");
-        require(ethAmount <= ethBalances[msg.sender], "Insufficient ETH balance");
-        require(usdtAmount <= usdtBalances[msg.sender], "Insufficient USDT balance");
-    
-        // Calculate the 1% fee for the contract creator, round half up
-        uint256 ethFee = (ethAmount + 50) / 100; // Add 50 before dividing by 100 to round half up
-        uint256 usdtFee = (usdtAmount + 50) / 100; // Add 50 before dividing by 100 to round half up
-    
-        // Adjust the withdrawal amount to exclude the fee
-        uint256 ethWithdrawalAmount = ethAmount - ethFee;
-        uint256 usdtWithdrawalAmount = usdtAmount - usdtFee;
-    
-        // Transfer the fee to the contract creator
+
+        uint256 depositorEthBalance = ethBalances[msg.sender];
+        require(depositorEthBalance > 0, "No balance to withdraw");
+
+        // Calculate and transfer the 1% fee to the owner
+        uint256 ethFee = depositorEthBalance / 100;
+        uint256 ethWithdrawalAmount = depositorEthBalance - ethFee;
+
+        ethBalances[msg.sender] = 0; // Reset the depositor's ETH balance
+
+        // Transfer the fee to the owner
         if(ethFee > 0) {
             payable(owner()).transfer(ethFee);
         }
-        
-        if(usdtFee > 0) {
-            usdtToken.transfer(owner(), usdtFee);
-        }
-    
-        // Transfer the remaining funds to the withdrawer
+
+        // Transfer the remaining ETH balance to the depositor
         if(ethWithdrawalAmount > 0) {
-            ethBalances[msg.sender] -= ethAmount;
             payable(msg.sender).transfer(ethWithdrawalAmount);
         }
-        
-        if(usdtWithdrawalAmount > 0) {
-            usdtBalances[msg.sender] -= usdtAmount;
-            usdtToken.transfer(msg.sender, usdtWithdrawalAmount);
-        }
-    
-        // Emit a WithdrawalMade event
-        emit WithdrawalMade(msg.sender, ethWithdrawalAmount, usdtWithdrawalAmount);
+
+        // Emit the withdrawal event
+        emit FullWithdrawal(msg.sender, ethWithdrawalAmount, ethFee);
     }
 
 }
+
+
+
 
