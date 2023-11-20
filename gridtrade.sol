@@ -67,5 +67,4 @@ contract GridTradingContract {
     }
 
 
-
 }
